@@ -182,7 +182,7 @@ def register(req: RegisterRequest):
         raise HTTPException(status_code=409, detail="Email already registered.")
 
     user_id = str(uuid.uuid4())
-    pw_hash = pwd_ctx.hash(req.password[:72])
+    pw_hash = pwd_ctx.hash(req.password)
 
     # Create a Stripe customer if Stripe is configured
     stripe_customer_id = None
@@ -212,7 +212,7 @@ def register(req: RegisterRequest):
 def login(req: LoginRequest):
     email = req.email.strip().lower()
     user  = _get_user_by_email(email)
-    if not user or not pwd_ctx.verify(req.password[:72], user["password_hash"]):
+    if not user or not pwd_ctx.verify(req.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Incorrect email or password.")
     return {
         "token":               _make_token(user["id"]),
