@@ -251,31 +251,14 @@ def account_status(authorization: str = Header(...)):
 
 @app.post("/stripe/checkout")
 def create_checkout(authorization: str = Header(...)):
+    """Returns a Stripe Checkout URL to start a subscription."""
     user_id = _verify_token(authorization.split(" ", 1)[1])
     user    = _get_user(user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
 
-    # Create Stripe customer now if missing (e.g. registered before Stripe was configured)
-    customer_id = user["stripe_customer_id"]
-    if not customer_id:
-        try:
-            cust = stripe.Customer.create(email=user["email"])
-            customer_id = cust.id
-            with _db() as c:
-                c.execute(
-                    "UPDATE users SET stripe_customer_id=? WHERE id=?",
-                    (customer_id, user_id)
-                )
-                c.commit()
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Stripe error: {e}")
-
-    if not STRIPE_PRICE_ID or "placeholder" in STRIPE_PRICE_ID:
-        raise HTTPException(status_code=500, detail="STRIPE_PRICE_ID not configured on server.")
-
     session = stripe.checkout.Session.create(
-        customer=customer_id,
+        customer=user["stripe_customer_id"],
         payment_method_types=["card"],
         line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
         mode="subscription",
