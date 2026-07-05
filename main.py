@@ -10,69 +10,127 @@ Endpoints:
   POST /stripe/portal          Manage subscription
   POST /stripe/webhook         Stripe event handler
   POST /v1/chat                Proxy to OpenAI (requires active sub)
+  POST /v1/transcribe          Transcribe audio via Whisper (requires active sub)
 
 Deploy to Railway / Render / Fly.io:
-  Set environment variables:
-    OPENAI_API_KEY       your OpenAI key (never exposed to users)
-    STRIPE_SECRET_KEY    sk_live_...
+  Required environment variables:
+    OPENAI_API_KEY        your OpenAI key (never exposed to users)
+    STRIPE_SECRET_KEY     sk_live_...
     STRIPE_WEBHOOK_SECRET whsec_...
-    STRIPE_PRICE_ID      price_... (your £9.99/mo product)
-    JWT_SECRET           any long random string
-    APP_URL              https://yourapp.com (for Stripe redirects)
-    DATABASE_URL         (optional) postgresql://...  defaults to SQLite
+    STRIPE_PRICE_ID       price_... (your £9.99/mo product)
+    JWT_SECRET            any long random string
+
+  Optional:
+    APP_URL               https://yourapp.com  (for Stripe redirects)
+    DATABASE_URL          postgresql://...     (Railway Postgres — strongly recommended)
+    DB_PATH               /data/wiebke.db      (SQLite path when DATABASE_URL is not set)
+
+  On Railway: add a PostgreSQL service — DATABASE_URL is injected automatically.
+  Without DATABASE_URL the server falls back to SQLite, which is wiped on every
+  redeploy. Use SQLite only for local development.
 """
 
-import hashlib
 import os
 import sqlite3
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Generator
 
 import stripe
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from jose import JWTError, jwt
 from openai import OpenAI
 from passlib.context import CryptContext
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 # Config
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 
-OPENAI_API_KEY      = os.environ["OPENAI_API_KEY"]
-STRIPE_SECRET_KEY   = os.environ["STRIPE_SECRET_KEY"]
-STRIPE_WEBHOOK_SEC  = os.environ["STRIPE_WEBHOOK_SECRET"]
-STRIPE_PRICE_ID     = os.environ["STRIPE_PRICE_ID"]
-JWT_SECRET          = os.environ.get("JWT_SECRET", "change-me-in-production")
-APP_URL             = os.environ.get("APP_URL", "https://wiebke.app")
-JWT_ALGORITHM       = "HS256"
-ACCESS_TOKEN_TTL    = 60 * 60 * 24 * 30   # 30 days
+OPENAI_API_KEY     = os.environ["OPENAI_API_KEY"]
+STRIPE_SECRET_KEY  = os.environ["STRIPE_SECRET_KEY"]
+STRIPE_WEBHOOK_SEC = os.environ["STRIPE_WEBHOOK_SECRET"]
+STRIPE_PRICE_ID    = os.environ["STRIPE_PRICE_ID"]
+JWT_SECRET         = os.environ.get("JWT_SECRET", "change-me-in-production")
+APP_URL            = os.environ.get("APP_URL", "https://wiebke.app")
+DATABASE_URL       = os.environ.get("DATABASE_URL", "")
+JWT_ALGORITHM      = "HS256"
+ACCESS_TOKEN_TTL   = 60 * 60 * 24 * 30  # 30 days
 
 stripe.api_key = STRIPE_SECRET_KEY
 openai_client  = OpenAI(api_key=OPENAI_API_KEY)
 pwd_ctx        = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
-# ──────────────────────────────────────────────
-# Database (SQLite; swap for Postgres in prod)
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
+# Database — PostgreSQL (preferred) or SQLite (local / fallback)
+# ──────────────────────────────────────────────────────────────────
 
+# Railway injects DATABASE_URL as  postgres://...
+# psycopg2 requires the scheme to be postgresql://
+_PG_URL      = DATABASE_URL.replace("postgres://", "postgresql://", 1) if DATABASE_URL else ""
+USE_POSTGRES = _PG_URL.startswith("postgresql://")
+
+# SQLite fallback — only used when DATABASE_URL is not set
 DB_PATH = Path(os.environ.get("DB_PATH", "wiebke_users.db"))
 
-def _db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+# Paramstyle differs between the two drivers:  %s (psycopg2)  vs  ? (sqlite3)
+PH = "%s" if USE_POSTGRES else "?"
 
-def _init_db():
-    with _db() as c:
-        c.execute("""
+# Eagerly import psycopg2 if Postgres is configured so a missing package
+# surfaces at startup rather than on the first database call.
+if USE_POSTGRES:
+    try:
+        import psycopg2
+        import psycopg2.extras
+    except ImportError as exc:
+        raise RuntimeError(
+            "DATABASE_URL points to PostgreSQL but psycopg2 is not installed. "
+            "Add  psycopg2-binary>=2.9  to requirements.txt and redeploy."
+        ) from exc
+
+
+@contextmanager
+def _db() -> Generator:
+    """
+    Open a database connection and yield its cursor.
+
+    Commits automatically on clean exit; rolls back and re-raises on any
+    exception; always closes the connection.
+
+    Both backends return dict-like rows so column access by name works the
+    same way for callers:
+      - PostgreSQL  → psycopg2 RealDictRow   (row["email"])
+      - SQLite      → sqlite3.Row            (row["email"])
+    """
+    if USE_POSTGRES:
+        conn = psycopg2.connect(_PG_URL)
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cur  = conn.cursor()
+
+    try:
+        yield cur
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _init_db() -> None:
+    """Create the users table if it does not already exist."""
+    with _db() as cur:
+        cur.execute(f"""
             CREATE TABLE IF NOT EXISTS users (
                 id                  TEXT PRIMARY KEY,
                 email               TEXT UNIQUE NOT NULL,
@@ -83,12 +141,56 @@ def _init_db():
                 created_at          TEXT
             )
         """)
-        c.commit()
 
 
-# ──────────────────────────────────────────────
+# ── Row-level helpers ────────────────────────────────────────────
+
+def _get_user(user_id: str):
+    with _db() as cur:
+        cur.execute(f"SELECT * FROM users WHERE id = {PH}", (user_id,))
+        return cur.fetchone()
+
+
+def _get_user_by_email(email: str):
+    with _db() as cur:
+        cur.execute(f"SELECT * FROM users WHERE email = {PH}", (email.lower(),))
+        return cur.fetchone()
+
+
+def _create_user(
+    user_id: str,
+    email: str,
+    pw_hash: str,
+    stripe_customer_id: str,
+    created_at: str,
+) -> None:
+    with _db() as cur:
+        cur.execute(
+            f"""INSERT INTO users
+                    (id, email, password_hash, stripe_customer_id, created_at)
+                VALUES ({PH}, {PH}, {PH}, {PH}, {PH})""",
+            (user_id, email, pw_hash, stripe_customer_id, created_at),
+        )
+
+
+def _update_subscription(
+    stripe_customer_id: str,
+    status: str,
+    end_date: str | None = None,
+) -> None:
+    with _db() as cur:
+        cur.execute(
+            f"""UPDATE users
+                   SET subscription_status = {PH},
+                       subscription_end    = {PH}
+                 WHERE stripe_customer_id  = {PH}""",
+            (status, end_date, stripe_customer_id),
+        )
+
+
+# ──────────────────────────────────────────────────────────────────
 # JWT helpers
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 
 def _make_token(user_id: str) -> str:
     payload = {
@@ -100,7 +202,7 @@ def _make_token(user_id: str) -> str:
 
 
 def _verify_token(token: str) -> str:
-    """Returns user_id or raises HTTPException."""
+    """Decode a JWT and return the user_id, or raise HTTP 401."""
     try:
         data = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         return data["sub"]
@@ -108,49 +210,49 @@ def _verify_token(token: str) -> str:
         raise HTTPException(status_code=401, detail="Invalid or expired token.")
 
 
-def _get_user(user_id: str) -> sqlite3.Row | None:
-    with _db() as c:
-        return c.execute(
-            "SELECT * FROM users WHERE id = ?", (user_id,)
-        ).fetchone()
-
-
-def _get_user_by_email(email: str) -> sqlite3.Row | None:
-    with _db() as c:
-        return c.execute(
-            "SELECT * FROM users WHERE email = ?", (email.lower(),)
-        ).fetchone()
-
-
-# ──────────────────────────────────────────────
-# Auth dependency
-# ──────────────────────────────────────────────
-
-def require_active_sub(authorization: str = Header(...)):
-    """FastAPI dependency — validates JWT and checks subscription is active."""
+def _bearer_user_id(authorization: str) -> str:
+    """Extract and verify the user_id from an  Authorization: Bearer <token>  header."""
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing Bearer token.")
-    token   = authorization.split(" ", 1)[1]
-    user_id = _verify_token(token)
+    return _verify_token(authorization.split(" ", 1)[1])
+
+
+# ──────────────────────────────────────────────────────────────────
+# Auth dependency  (used by gated endpoints)
+# ──────────────────────────────────────────────────────────────────
+
+def require_active_sub(authorization: str = Header(...)) -> str:
+    """
+    FastAPI dependency — validates the JWT and confirms an active subscription.
+    Returns the user_id on success.
+    """
+    user_id = _bearer_user_id(authorization)
     user    = _get_user(user_id)
     if not user:
-        raise HTTPException(status_code=401, detail="User not found.")
+        raise HTTPException(status_code=401, detail="User not found. Please log in again.")
     if user["subscription_status"] != "active":
         raise HTTPException(
             status_code=402,
-            detail="No active subscription. Visit the Account page to subscribe."
+            detail="No active subscription. Visit the Account page to subscribe.",
         )
     return user_id
 
 
-# ──────────────────────────────────────────────
-# App
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
+# App + lifespan
+# ──────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _init_db()
+    if USE_POSTGRES:
+        # Show host only — never log credentials
+        host = _PG_URL.split("@")[-1] if "@" in _PG_URL else _PG_URL
+        print(f"[wiebke_cloud] database: PostgreSQL  ({host})")
+    else:
+        print(f"[wiebke_cloud] database: SQLite  ({DB_PATH})  — not suitable for Railway")
     yield
+
 
 app = FastAPI(title="Wiebke Cloud", lifespan=lifespan)
 
@@ -162,49 +264,38 @@ app.add_middleware(
 )
 
 
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 # Auth endpoints
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 
 class RegisterRequest(BaseModel):
-    email: str
+    email:    str
     password: str
 
+
 class LoginRequest(BaseModel):
-    email: str
+    email:    str
     password: str
 
 
 @app.post("/auth/register")
 def register(req: RegisterRequest):
     email = req.email.strip().lower()
+
     if _get_user_by_email(email):
         raise HTTPException(status_code=409, detail="Email already registered.")
 
-    user_id = str(uuid.uuid4())
-    pw_hash = pwd_ctx.hash(req.password)
+    user_id     = str(uuid.uuid4())
+    pw_hash     = pwd_ctx.hash(req.password)
+    stripe_cust = stripe.Customer.create(email=email)
 
-    # Create a Stripe customer if Stripe is configured
-    stripe_customer_id = None
-    if STRIPE_SECRET_KEY and "placeholder" not in STRIPE_SECRET_KEY:
-        try:
-            stripe_customer = stripe.Customer.create(email=email)
-            stripe_customer_id = stripe_customer.id
-        except Exception as e:
-            # Non-fatal: user can still register, subscription just won't have Stripe linked yet
-            print(f"[Stripe] Could not create customer: {e}")
-
-    with _db() as c:
-        c.execute(
-            """INSERT INTO users
-               (id, email, password_hash, stripe_customer_id, created_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (user_id, email, pw_hash,
-             stripe_customer_id,
-             datetime.now(timezone.utc).isoformat())
-        )
-        c.commit()
-
+    _create_user(
+        user_id            = user_id,
+        email              = email,
+        pw_hash            = pw_hash,
+        stripe_customer_id = stripe_cust.id,
+        created_at         = datetime.now(timezone.utc).isoformat(),
+    )
     return {"token": _make_token(user_id), "email": email}
 
 
@@ -212,8 +303,10 @@ def register(req: RegisterRequest):
 def login(req: LoginRequest):
     email = req.email.strip().lower()
     user  = _get_user_by_email(email)
+
     if not user or not pwd_ctx.verify(req.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Incorrect email or password.")
+
     return {
         "token":               _make_token(user["id"]),
         "email":               user["email"],
@@ -222,22 +315,25 @@ def login(req: LoginRequest):
 
 
 @app.post("/auth/refresh")
-def refresh_token(user_id: str = Depends(lambda auth=Header(...): _verify_token(auth.split(" ", 1)[-1]))):
+def refresh_token(authorization: str = Header(...)):
+    """Issue a fresh token without requiring the password again."""
+    user_id = _bearer_user_id(authorization)
     return {"token": _make_token(user_id)}
 
 
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 # Account
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 
 @app.get("/account/status")
 def account_status(authorization: str = Header(...)):
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing Bearer token.")
-    user_id = _verify_token(authorization.split(" ", 1)[1])
+    user_id = _bearer_user_id(authorization)
     user    = _get_user(user_id)
     if not user:
-        raise HTTPException(status_code=404, detail="User not found.")
+        # Token is valid but user row is gone (e.g. account deleted).
+        # Return 401 so the desktop clears its stored token instead of
+        # looping on 404 and showing a confusing "Not Found" message.
+        raise HTTPException(status_code=401, detail="User not found. Please log in again.")
     return {
         "email":               user["email"],
         "subscription_status": user["subscription_status"],
@@ -245,48 +341,48 @@ def account_status(authorization: str = Header(...)):
     }
 
 
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 # Stripe
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
 
 @app.post("/stripe/checkout")
 def create_checkout(authorization: str = Header(...)):
-    """Returns a Stripe Checkout URL to start a subscription."""
-    user_id = _verify_token(authorization.split(" ", 1)[1])
+    """Return a Stripe Checkout URL to start a new subscription."""
+    user_id = _bearer_user_id(authorization)
     user    = _get_user(user_id)
     if not user:
-        raise HTTPException(status_code=404, detail="User not found.")
+        raise HTTPException(status_code=401, detail="User not found. Please log in again.")
 
     session = stripe.checkout.Session.create(
-        customer=user["stripe_customer_id"],
-        payment_method_types=["card"],
-        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
-        mode="subscription",
-        success_url=f"{APP_URL}/subscribe/success?session_id={{CHECKOUT_SESSION_ID}}",
-        cancel_url=f"{APP_URL}/subscribe/cancel",
-        metadata={"user_id": user_id},
+        customer             = user["stripe_customer_id"],
+        payment_method_types = ["card"],
+        line_items           = [{"price": STRIPE_PRICE_ID, "quantity": 1}],
+        mode                 = "subscription",
+        success_url          = f"{APP_URL}/subscribe/success?session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url           = f"{APP_URL}/subscribe/cancel",
+        metadata             = {"user_id": user_id},
     )
     return {"checkout_url": session.url}
 
 
 @app.post("/stripe/portal")
 def customer_portal(authorization: str = Header(...)):
-    """Returns a Stripe Customer Portal URL for managing billing."""
-    user_id = _verify_token(authorization.split(" ", 1)[1])
+    """Return a Stripe Customer Portal URL for managing billing."""
+    user_id = _bearer_user_id(authorization)
     user    = _get_user(user_id)
     if not user or not user["stripe_customer_id"]:
         raise HTTPException(status_code=404, detail="No billing account found.")
 
     session = stripe.billing_portal.Session.create(
-        customer=user["stripe_customer_id"],
-        return_url=f"{APP_URL}/account",
+        customer   = user["stripe_customer_id"],
+        return_url = f"{APP_URL}/account",
     )
     return {"portal_url": session.url}
 
 
 @app.post("/stripe/webhook")
 async def stripe_webhook(request: Request):
-    """Handle Stripe events (subscription activated, cancelled, etc.)."""
+    """Handle Stripe events and update subscription status in the database."""
     payload = await request.body()
     sig     = request.headers.get("stripe-signature", "")
 
@@ -295,66 +391,60 @@ async def stripe_webhook(request: Request):
     except stripe.error.SignatureVerificationError:
         raise HTTPException(status_code=400, detail="Invalid Stripe signature.")
 
-    def _update(customer_id: str, status: str, end_date: str | None = None):
-        with _db() as c:
-            c.execute(
-                """UPDATE users
-                   SET subscription_status=?, subscription_end=?
-                   WHERE stripe_customer_id=?""",
-                (status, end_date, customer_id)
-            )
-            c.commit()
+    obj = event["data"]["object"]
 
     if event["type"] == "customer.subscription.created":
-        sub = event["data"]["object"]
-        _update(sub["customer"], "active")
+        _update_subscription(obj["customer"], "active")
 
     elif event["type"] == "customer.subscription.updated":
-        sub    = event["data"]["object"]
-        status = "active" if sub["status"] == "active" else "inactive"
-        end    = datetime.fromtimestamp(
-            sub["current_period_end"], tz=timezone.utc
-        ).isoformat() if sub.get("current_period_end") else None
-        _update(sub["customer"], status, end)
+        status = "active" if obj["status"] == "active" else "inactive"
+        end    = (
+            datetime.fromtimestamp(
+                obj["current_period_end"], tz=timezone.utc
+            ).isoformat()
+            if obj.get("current_period_end") else None
+        )
+        _update_subscription(obj["customer"], status, end)
 
     elif event["type"] in (
         "customer.subscription.deleted",
         "customer.subscription.paused",
     ):
-        sub = event["data"]["object"]
-        _update(sub["customer"], "cancelled")
+        _update_subscription(obj["customer"], "cancelled")
 
     elif event["type"] == "invoice.payment_failed":
-        inv = event["data"]["object"]
-        _update(inv["customer"], "past_due")
+        _update_subscription(obj["customer"], "past_due")
 
     return {"received": True}
 
 
-# ──────────────────────────────────────────────
-# OpenAI proxy — the core value
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────
+# OpenAI proxy  (requires an active subscription)
+# ──────────────────────────────────────────────────────────────────
 
 class ProxyChatRequest(BaseModel):
-    messages: list
-    model:    str = "gpt-4.1-mini"
+    messages:    list
+    model:       str   = "gpt-4.1-mini"
     temperature: float = 0.85
-    max_tokens:  int = 1024
+    max_tokens:  int   = 1024
 
 
 @app.post("/v1/chat")
-def proxy_chat(req: ProxyChatRequest, user_id: str = Depends(require_active_sub)):
-    """Forward a prepared messages array to OpenAI on behalf of a subscriber."""
+def proxy_chat(
+    req:     ProxyChatRequest,
+    user_id: str = Depends(require_active_sub),
+):
+    """Forward a messages array to OpenAI on behalf of an active subscriber."""
     try:
         response = openai_client.chat.completions.create(
-            model=req.model,
-            messages=req.messages,
-            temperature=req.temperature,
-            max_tokens=req.max_tokens,
+            model       = req.model,
+            messages    = req.messages,
+            temperature = req.temperature,
+            max_tokens  = req.max_tokens,
         )
         return {"content": response.choices[0].message.content}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"OpenAI error: {e}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"OpenAI error: {exc}")
 
 
 class ProxyTranscribeRequest(BaseModel):
@@ -363,21 +453,30 @@ class ProxyTranscribeRequest(BaseModel):
 
 
 @app.post("/v1/transcribe")
-def proxy_transcribe(req: ProxyTranscribeRequest, user_id: str = Depends(require_active_sub)):
-    """Transcribe audio via Whisper on behalf of a subscriber."""
-    import base64, io
+def proxy_transcribe(
+    req:     ProxyTranscribeRequest,
+    user_id: str = Depends(require_active_sub),
+):
+    """Transcribe audio via Whisper on behalf of an active subscriber."""
+    import base64
+    import io
+
     try:
-        audio_bytes = base64.b64decode(req.audio_base64)
-        audio_file  = io.BytesIO(audio_bytes)
-        audio_file.name = req.filename
+        audio_bytes      = base64.b64decode(req.audio_base64)
+        audio_file       = io.BytesIO(audio_bytes)
+        audio_file.name  = req.filename
         result = openai_client.audio.transcriptions.create(
-            model="whisper-1",
-            file=audio_file,
+            model = "whisper-1",
+            file  = audio_file,
         )
         return {"text": result.text}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Whisper error: {e}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Whisper error: {exc}")
 
+
+# ──────────────────────────────────────────────────────────────────
+# Entry point
+# ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
