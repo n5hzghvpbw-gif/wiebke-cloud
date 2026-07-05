@@ -184,8 +184,14 @@ def register(req: RegisterRequest):
     user_id = str(uuid.uuid4())
     pw_hash = pwd_ctx.hash(req.password)
 
-    # Create a Stripe customer so we can attach subscriptions later
-    stripe_customer = stripe.Customer.create(email=email)
+   # Create a Stripe customer (optional — skipped if Stripe not configured yet)
+    stripe_customer_id = None
+    if STRIPE_SECRET_KEY and not STRIPE_SECRET_KEY.startswith("sk_test_placeholder"):
+        try:
+            stripe_customer = stripe.Customer.create(email=email)
+            stripe_customer_id = stripe_customer.id
+        except Exception:
+            pass
 
     with _db() as c:
         c.execute(
@@ -193,7 +199,7 @@ def register(req: RegisterRequest):
                (id, email, password_hash, stripe_customer_id, created_at)
                VALUES (?, ?, ?, ?, ?)""",
             (user_id, email, pw_hash,
-             stripe_customer.id,
+             stripe_customer_id,
              datetime.now(timezone.utc).isoformat())
         )
         c.commit()
