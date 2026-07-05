@@ -3,7 +3,8 @@ uvicorn[standard]>=0.30
 openai>=1.30
 stripe>=9.0
 python-jose[cryptography]>=3.3
-passlib[bcrypt]>=1.7
+bcrypt>=4.0
 pydantic>=2.0
 python-multipart>=0.0.9
 psycopg2-binary>=2.9
+
