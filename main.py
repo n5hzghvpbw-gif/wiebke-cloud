@@ -45,10 +45,10 @@ from pydantic import BaseModel, EmailStr
 # Config
 # ──────────────────────────────────────────────
 
-OPENAI_API_KEY      = os.environ["OPENAI_API_KEY"]
-STRIPE_SECRET_KEY   = os.environ["STRIPE_SECRET_KEY"]
-STRIPE_WEBHOOK_SEC  = os.environ["STRIPE_WEBHOOK_SECRET"]
-STRIPE_PRICE_ID     = os.environ["STRIPE_PRICE_ID"]
+OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY", "")
+STRIPE_SECRET_KEY   = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SEC  = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_PRICE_ID     = os.environ.get("STRIPE_PRICE_ID", "")
 JWT_SECRET          = os.environ.get("JWT_SECRET", "change-me-in-production")
 APP_URL             = os.environ.get("APP_URL", "https://wiebke.app")
 JWT_ALGORITHM       = "HS256"
