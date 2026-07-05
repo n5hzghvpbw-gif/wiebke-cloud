@@ -45,10 +45,10 @@ from pydantic import BaseModel, EmailStr
 # Config
 # ──────────────────────────────────────────────
 
-OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY", "")
-STRIPE_SECRET_KEY   = os.environ.get("STRIPE_SECRET_KEY", "")
-STRIPE_WEBHOOK_SEC  = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
-STRIPE_PRICE_ID     = os.environ.get("STRIPE_PRICE_ID", "")
+OPENAI_API_KEY      = os.environ["OPENAI_API_KEY"]
+STRIPE_SECRET_KEY   = os.environ["STRIPE_SECRET_KEY"]
+STRIPE_WEBHOOK_SEC  = os.environ["STRIPE_WEBHOOK_SECRET"]
+STRIPE_PRICE_ID     = os.environ["STRIPE_PRICE_ID"]
 JWT_SECRET          = os.environ.get("JWT_SECRET", "change-me-in-production")
 APP_URL             = os.environ.get("APP_URL", "https://wiebke.app")
 JWT_ALGORITHM       = "HS256"
@@ -184,14 +184,15 @@ def register(req: RegisterRequest):
     user_id = str(uuid.uuid4())
     pw_hash = pwd_ctx.hash(req.password)
 
-   # Create a Stripe customer (optional — skipped if Stripe not configured yet)
+    # Create a Stripe customer if Stripe is configured
     stripe_customer_id = None
-    if STRIPE_SECRET_KEY and not STRIPE_SECRET_KEY.startswith("sk_test_placeholder"):
+    if STRIPE_SECRET_KEY and "placeholder" not in STRIPE_SECRET_KEY:
         try:
             stripe_customer = stripe.Customer.create(email=email)
             stripe_customer_id = stripe_customer.id
-        except Exception:
-            pass
+        except Exception as e:
+            # Non-fatal: user can still register, subscription just won't have Stripe linked yet
+            print(f"[Stripe] Could not create customer: {e}")
 
     with _db() as c:
         c.execute(
