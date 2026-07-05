@@ -43,9 +43,11 @@ import stripe
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+import bcrypt
+import hashlib
+
 from jose import JWTError, jwt
 from openai import OpenAI
-from passlib.context import CryptContext
 from pydantic import BaseModel
 
 # ──────────────────────────────────────────────────────────────────
@@ -64,7 +66,25 @@ ACCESS_TOKEN_TTL   = 60 * 60 * 24 * 30  # 30 days
 
 stripe.api_key = STRIPE_SECRET_KEY
 openai_client  = OpenAI(api_key=OPENAI_API_KEY)
-pwd_ctx        = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+# ──────────────────────────────────────────────────────────────────
+# Password hashing  (bcrypt direct — no passlib)
+# ──────────────────────────────────────────────────────────────────
+#
+# bcrypt silently truncates passwords longer than 72 bytes, which is
+# a silent security degradation. We pre-hash with SHA-256 (32 bytes)
+# so every password, regardless of length, is treated consistently.
+# The bcrypt layer still provides the slow, salted work factor.
+
+def _hash_password(password: str) -> str:
+    digest = hashlib.sha256(password.encode("utf-8")).digest()
+    return bcrypt.hashpw(digest, bcrypt.gensalt(rounds=12)).decode("utf-8")
+
+
+def _verify_password(password: str, stored_hash: str) -> bool:
+    digest = hashlib.sha256(password.encode("utf-8")).digest()
+    return bcrypt.checkpw(digest, stored_hash.encode("utf-8"))
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -286,7 +306,7 @@ def register(req: RegisterRequest):
         raise HTTPException(status_code=409, detail="Email already registered.")
 
     user_id     = str(uuid.uuid4())
-    pw_hash     = pwd_ctx.hash(req.password)
+    pw_hash     = _hash_password(req.password)
     stripe_cust = stripe.Customer.create(email=email)
 
     _create_user(
@@ -304,7 +324,7 @@ def login(req: LoginRequest):
     email = req.email.strip().lower()
     user  = _get_user_by_email(email)
 
-    if not user or not pwd_ctx.verify(req.password, user["password_hash"]):
+    if not user or not _verify_password(req.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Incorrect email or password.")
 
     return {
