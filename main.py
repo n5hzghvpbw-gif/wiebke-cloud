@@ -43,6 +43,7 @@ import stripe
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 import bcrypt
 import hashlib
 
@@ -436,6 +437,164 @@ async def stripe_webhook(request: Request):
         _update_subscription(obj["customer"], "past_due")
 
     return {"received": True}
+
+
+# ──────────────────────────────────────────────────────────────────
+# Subscription landing pages
+# ──────────────────────────────────────────────────────────────────
+
+_PAGE_BASE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>{title} — Wiebke</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      background: #1A0700;
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }}
+    .card {{
+      background: #2A1400;
+      border: 1px solid rgba(249,115,22,0.2);
+      border-radius: 20px;
+      padding: 56px 48px;
+      max-width: 480px;
+      width: 100%;
+      text-align: center;
+    }}
+    .mark {{
+      display: inline-block;
+      margin-bottom: 32px;
+    }}
+    .icon-circle {{
+      width: 72px;
+      height: 72px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0 auto 28px;
+      font-size: 32px;
+    }}
+    .icon-circle.success {{ background: rgba(249,115,22,0.15); }}
+    .icon-circle.cancel  {{ background: rgba(255,255,255,0.06); }}
+    h1 {{
+      font-size: 26px;
+      font-weight: 700;
+      margin-bottom: 12px;
+      color: #fff;
+    }}
+    p {{
+      font-size: 15px;
+      color: rgba(255,255,255,0.6);
+      line-height: 1.6;
+      margin-bottom: 8px;
+    }}
+    .highlight {{ color: #F97316; font-weight: 600; }}
+    .divider {{
+      border: none;
+      border-top: 1px solid rgba(255,255,255,0.08);
+      margin: 32px 0;
+    }}
+    .step {{
+      display: flex;
+      align-items: flex-start;
+      gap: 14px;
+      text-align: left;
+      margin-bottom: 16px;
+    }}
+    .step-num {{
+      flex-shrink: 0;
+      width: 26px;
+      height: 26px;
+      border-radius: 50%;
+      background: rgba(249,115,22,0.2);
+      color: #F97316;
+      font-size: 12px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-top: 1px;
+    }}
+    .step p {{ margin: 0; }}
+  </style>
+</head>
+<body>
+  {body}
+</body>
+</html>"""
+
+_SUCCESS_BODY = """
+<div class="card">
+  <div class="mark">
+    <svg width="48" height="48" viewBox="0 0 56 56" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <rect width="56" height="56" rx="14" fill="#1A0700"/>
+      <path d="M 8 14 L 16 42 L 22 25 L 28.5 42 L 36 14"
+        stroke="#F97316" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M 36 14 L 36 42" stroke="#F97316" stroke-width="4" stroke-linecap="round"/>
+      <path d="M 36 28 L 47 14" stroke="#FCD34D" stroke-width="3.5" stroke-linecap="round"/>
+      <path d="M 36 28 L 48 42" stroke="#FCD34D" stroke-width="3.5" stroke-linecap="round"/>
+    </svg>
+  </div>
+  <div class="icon-circle success">✓</div>
+  <h1>You're subscribed</h1>
+  <p>Your <span class="highlight">Wiebke Pro</span> subscription is now active.</p>
+  <hr class="divider"/>
+  <div class="step">
+    <div class="step-num">1</div>
+    <p>Return to the Wiebke app on your desktop.</p>
+  </div>
+  <div class="step">
+    <div class="step-num">2</div>
+    <p>Go to <strong style="color:#fff">Account</strong> and click <strong style="color:#fff">Refresh status</strong>.</p>
+  </div>
+  <div class="step">
+    <div class="step-num">3</div>
+    <p>Your plan will show <span class="highlight">Active</span> — you can now use Chat.</p>
+  </div>
+  <hr class="divider"/>
+  <p style="font-size:13px">You can close this tab.</p>
+</div>"""
+
+_CANCEL_BODY = """
+<div class="card">
+  <div class="mark">
+    <svg width="48" height="48" viewBox="0 0 56 56" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <rect width="56" height="56" rx="14" fill="#1A0700"/>
+      <path d="M 8 14 L 16 42 L 22 25 L 28.5 42 L 36 14"
+        stroke="#F97316" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M 36 14 L 36 42" stroke="#F97316" stroke-width="4" stroke-linecap="round"/>
+      <path d="M 36 28 L 47 14" stroke="#FCD34D" stroke-width="3.5" stroke-linecap="round"/>
+      <path d="M 36 28 L 48 42" stroke="#FCD34D" stroke-width="3.5" stroke-linecap="round"/>
+    </svg>
+  </div>
+  <div class="icon-circle cancel" style="font-size:28px; color:rgba(255,255,255,0.3)">×</div>
+  <h1>Payment cancelled</h1>
+  <p>No charge was made. You can subscribe any time from the Account page in the Wiebke app.</p>
+  <hr class="divider"/>
+  <p style="font-size:13px">You can close this tab.</p>
+</div>"""
+
+
+@app.get("/subscribe/success", response_class=HTMLResponse)
+def subscribe_success():
+    """Stripe redirects here after a successful checkout."""
+    return _PAGE_BASE.format(title="Subscription active", body=_SUCCESS_BODY)
+
+
+@app.get("/subscribe/cancel", response_class=HTMLResponse)
+def subscribe_cancel():
+    """Stripe redirects here if the user closes the checkout."""
+    return _PAGE_BASE.format(title="Payment cancelled", body=_CANCEL_BODY)
 
 
 # ──────────────────────────────────────────────────────────────────
