@@ -654,6 +654,135 @@ def proxy_transcribe(
 
 
 # ──────────────────────────────────────────────────────────────────
+# Memory proxy  (requires an active subscription)
+#
+# Routes all memory operations (summarise, filter, extract, embed)
+# through the cloud so users never need their own OpenAI API key.
+# ──────────────────────────────────────────────────────────────────
+
+import json as _json
+
+
+class MemorySummarizeRequest(BaseModel):
+    question: str
+    answer:   str
+
+
+class MemoryFilterRequest(BaseModel):
+    question: str
+    answer:   str
+
+
+class MemoryExtractRequest(BaseModel):
+    question:  str
+    answer:    str
+    user_name: str = "User"
+
+
+class MemoryEmbedRequest(BaseModel):
+    text: str
+
+
+@app.post("/v1/memory/summarize")
+def memory_summarize(
+    req:     MemorySummarizeRequest,
+    user_id: str = Depends(require_active_sub),
+):
+    """Summarise a conversation turn for long-term memory storage."""
+    try:
+        resp = openai_client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[{"role": "user", "content": (
+                "Summarize this interaction.\n\n"
+                "Rules:\n- 1 to 3 sentences maximum.\n- Remove greetings.\n"
+                "- Remove jokes.\n- Preserve important facts.\n- Be concise.\n\n"
+                f"Question:\n{req.question}\n\nAnswer:\n{req.answer}"
+            )}],
+            temperature=0.3,
+            max_tokens=200,
+        )
+        return {"summary": resp.choices[0].message.content.strip()}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Summarize error: {exc}")
+
+
+@app.post("/v1/memory/filter")
+def memory_filter(
+    req:     MemoryFilterRequest,
+    user_id: str = Depends(require_active_sub),
+):
+    """Decide whether an interaction is worth storing as a long-term memory."""
+    try:
+        resp = openai_client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[{"role": "user", "content": (
+                "Determine whether this interaction should become a long-term memory.\n\n"
+                "Store: identity, preferences, projects, goals, relationships, pets, "
+                "hobbies, interests, vehicles, important life facts.\n\n"
+                "Do NOT store: time, date, weather, sports fixtures, temporary events, "
+                "news, one-off factual questions.\n\n"
+                f"Question:\n{req.question}\n\nAnswer:\n{req.answer}\n\n"
+                "Return ONLY True or False."
+            )}],
+            temperature=0.0,
+            max_tokens=10,
+        )
+        result = resp.choices[0].message.content.strip().lower()
+        return {"should_store": result == "true"}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Filter error: {exc}")
+
+
+@app.post("/v1/memory/extract")
+def memory_extract(
+    req:     MemoryExtractRequest,
+    user_id: str = Depends(require_active_sub),
+):
+    """Extract structured facts from a conversation turn."""
+    try:
+        resp = openai_client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[{"role": "user", "content": (
+                "You are a memory extraction system.\n\n"
+                f"USER:\n{req.question}\n\nASSISTANT:\n{req.answer}\n\n"
+                "Extract only facts useful long-term.\n"
+                "Categories: user_name, favorite_color, favorite_food, "
+                "favorite_drink, interests, important_people, pets, projects.\n\n"
+                "Return JSON only. Example:\n"
+                f'{{"user_name":"{req.user_name}","interests":["coding"]}}\n'
+                "If nothing to remember return: {}"
+            )}],
+            temperature=0.0,
+            max_tokens=500,
+        )
+        text = resp.choices[0].message.content.strip()
+        text = text.replace("```json", "").replace("```", "").strip()
+        try:
+            memories = _json.loads(text)
+        except Exception:
+            memories = {}
+        return {"memories": memories}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Extract error: {exc}")
+
+
+@app.post("/v1/memory/embed")
+def memory_embed(
+    req:     MemoryEmbedRequest,
+    user_id: str = Depends(require_active_sub),
+):
+    """Generate a text embedding vector for semantic memory search."""
+    try:
+        result = openai_client.embeddings.create(
+            model="text-embedding-3-small",
+            input=req.text,
+        )
+        return {"embedding": result.data[0].embedding}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Embed error: {exc}")
+
+
+# ──────────────────────────────────────────────────────────────────
 # Entry point
 # ──────────────────────────────────────────────────────────────────
 
