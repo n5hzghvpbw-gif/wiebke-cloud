@@ -22,6 +22,7 @@ Endpoints:
   POST /v1/memory/tags          Generate short tags for a turn (requires active sub)
   POST /v1/memory/rerank        Pick the most relevant candidate memories (requires active sub)
   POST /v1/memory/duplicate     Check a new memory against recent ones (requires active sub)
+  POST /v1/goals/parse          Extract {name, category, deadline} from a chat message (requires active sub)
 
 All OpenAI-touching endpoints meter their cost against the caller's monthly
 usage budget (see "AI usage metering" below). /v1/chat and /v1/transcribe are
@@ -1515,6 +1516,61 @@ False
     _add_usage(user_id, _chat_cost(SUPPORT_MODEL, resp.usage))
     result = resp.choices[0].message.content.strip().lower()
     return {"is_duplicate": result.startswith("true")}
+
+
+class GoalParseRequest(BaseModel):
+    message: str
+
+
+@app.post("/v1/goals/parse")
+def goals_parse(
+    req:     GoalParseRequest,
+    user_id: str = Depends(require_active_sub),
+):
+    """Extract a goal name/category/deadline from a chat message like
+    'add a goal to run a 5k by December'. Powers chat-driven goal
+    creation — the desktop dispatches straight to this from a matched
+    GOAL_CREATION intent, without a full companion-brain round trip."""
+    today = datetime.now(timezone.utc).date().isoformat()
+
+    prompt = f"""Extract a goal from this message.
+
+Message:
+
+{req.message}
+
+Today's date is {today}.
+
+Categories (pick the single best match): career, financial, fitness_wellbeing, personal, relationships, learning, other.
+
+Return ONLY JSON in this exact shape:
+{{"name": "short goal name", "category": "one of the categories above", "deadline": "YYYY-MM-DD or null"}}
+
+If a relative date is mentioned (e.g. "by December", "in 3 months", "next year"), resolve it to an actual YYYY-MM-DD date based on today's date. If no deadline is mentioned at all, use null for deadline.
+"""
+    try:
+        resp = openai_client.chat.completions.create(
+            model=SUPPORT_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=150,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Goal parse error: {exc}")
+
+    _add_usage(user_id, _chat_cost(SUPPORT_MODEL, resp.usage))
+
+    text = resp.choices[0].message.content.strip()
+    text = text.replace("```json", "").replace("```", "").strip()
+    try:
+        parsed = _json.loads(text)
+        return {
+            "name":     parsed.get("name") or req.message.strip()[:80],
+            "category": parsed.get("category") or "other",
+            "deadline": parsed.get("deadline"),
+        }
+    except Exception:
+        return {"name": req.message.strip()[:80], "category": "other", "deadline": None}
 
 
 # ──────────────────────────────────────────────────────────────────
