@@ -116,6 +116,13 @@ SUPPORT_MODEL          = "gpt-4.1-mini"  # tags/filter/extract/summarize/update/
 EMBEDDING_PRICE_PER_1M = 0.02            # text-embedding-3-small
 WHISPER_PRICE_PER_MIN  = 0.006
 
+# Display-only conversion for the desktop usage meter — actual enforcement
+# below stays dollar-based (it has to, since Economy vs Premium cost up to
+# ~15x apart per token). This is a rough blended average of the Economy
+# model's input/output price, just to give users an intuitive token-scale
+# number instead of a dollar figure. Not real per-request accounting.
+ECONOMY_BLENDED_PRICE_PER_1M = sum(ALLOWED_CHAT_MODELS[DEFAULT_CHAT_MODEL]) / 2
+
 # £4.00/month ≈ $5.00 — a static, conservative conversion (not live FX).
 # Retune these if GBP/USD moves a lot or OpenAI reprices.
 MONTHLY_BUDGET_USD = 5.00
@@ -683,6 +690,9 @@ def account_status(authorization: str = Header(...)):
         "usage_budget_usd":    MONTHLY_BUDGET_USD,
         "usage_period_start":  usage["period_start"],
         "usage_warn":          usage["cost_usd"] >= WARN_THRESHOLD_USD,
+        # Display-only token-equivalent — see ECONOMY_BLENDED_PRICE_PER_1M.
+        "usage_tokens":        round(usage["cost_usd"] / ECONOMY_BLENDED_PRICE_PER_1M * 1_000_000),
+        "usage_tokens_budget": round(MONTHLY_BUDGET_USD / ECONOMY_BLENDED_PRICE_PER_1M * 1_000_000),
     }
 
 
